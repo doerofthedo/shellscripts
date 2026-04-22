@@ -1,0 +1,19 @@
+#!/bin/bash
+[ "${1:0:1}" = "-" ] && LINES="${1#-}" && shift
+[ -z "$LINES" ] && LINES=10
+
+LINEST=$(( $LINES / 2))
+LINESH=$(( $LINES - $LINEST ))
+
+[ $LINESH == 0 ] && exit
+[ $LINEST == 0 ] && head -n$LINESH "${1:--}" && exit
+
+awk -v h=$LINESH -v t=$LINEST '
+NR<=h{print;next}
+{buf[NR%t]=$0}
+END{
+	if(NR<=h)exit
+	if (NR>h+t)print "==> (" NR-h-t " more lines) <=="
+	cont=NR-t+1; if(cont<h+1)cont=h+1
+	for(i=cont;i<=NR;i++)print buf[i%t]
+}' "${1:--}"

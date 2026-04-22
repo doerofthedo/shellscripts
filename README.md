@@ -23,6 +23,7 @@ This section is included because it may be impossible to understand what some of
 * `deflate` deflates content
 * `diffsort <file1> <file2>` diff two files, but sort them before diffing
 * `filldisk` fills the current directory with randomized 4GiB files
+* `headtail [-N] [file]` prints N lines from the beginning and end of the file
 * `htmlentitydecode` decodes HTML entities
 * `inflate` inflates deflated content
 * `json2csv` converts json input to csv output
