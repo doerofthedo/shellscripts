@@ -1,0 +1,133 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+DRY_RUN=0
+NO_COLOR=0
+
+for arg in "$@"; do
+	case "$arg" in
+	--dry-run) DRY_RUN=1 ;;
+	--no-color) NO_COLOR=1 ;;
+	-h | --help)
+		cat <<'EOF'
+Usage: upgradeall [--dry-run] [--no-color]
+
+Handles:
+  - kept back / deferred due to new deps (uses --with-new-pkgs)
+  - deferred due to phasing (re-runs with phasing override only if needed)
+EOF
+		exit 0
+		;;
+	*)
+		echo "Unknown arg: $arg" >&2
+		exit 2
+		;;
+	esac
+done
+
+if [[ "$NO_COLOR" -eq 1 || ! -t 1 ]]; then
+	RED=""
+	GREEN=""
+	YELLOW=""
+	BLUE=""
+	RESET=""
+else
+	RED=$'\e[31m'
+	GREEN=$'\e[32m'
+	YELLOW=$'\e[33m'
+	BLUE=$'\e[34m'
+	RESET=$'\e[0m'
+fi
+
+die() {
+	echo -e "${RED}ERROR:${RESET} $*" >&2
+	exit 1
+}
+trap 'die "Failed at line $LINENO: $BASH_COMMAND"' ERR
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || die "Please run this script as root or using sudo."
+
+for cmd in apt-get apt-mark awk sort comm; do
+	command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
+done
+
+export DEBIAN_FRONTEND=noninteractive
+
+APT_OPTS=(
+	-o Dpkg::Use-Pty=0
+	-o Acquire::Retries=3
+)
+
+PHASE_OPTS=(-o APT::Get::Always-Include-Phased-Updates=true)
+
+extract_inst_pkgs() {
+	awk '/^Inst /{print $2}' | sort -u
+}
+
+run_cmd() {
+	if [[ "$DRY_RUN" -eq 1 ]]; then
+		echo -e "${YELLOW}[dry-run]${RESET} $*"
+	else
+		"$@"
+	fi
+}
+
+echo -e "${BLUE}Updating package lists...${RESET}"
+run_cmd apt-get "${APT_OPTS[@]}" update -y
+
+echo -e "${BLUE}Analysing upgrade candidates...${RESET}"
+
+tmp_normal="$(mktemp)"
+tmp_newpkgs="$(mktemp)"
+tmp_phased="$(mktemp)"
+trap 'rm -f "$tmp_normal" "$tmp_newpkgs" "$tmp_phased"' EXIT
+
+apt-get -s "${APT_OPTS[@]}" upgrade 2>/dev/null | extract_inst_pkgs >"$tmp_normal" &
+pid_normal=$!
+apt-get -s "${APT_OPTS[@]}" --with-new-pkgs upgrade 2>/dev/null | extract_inst_pkgs >"$tmp_newpkgs" &
+pid_newpkgs=$!
+apt-get -s "${APT_OPTS[@]}" "${PHASE_OPTS[@]}" --with-new-pkgs upgrade 2>/dev/null | extract_inst_pkgs >"$tmp_phased" &
+pid_phased=$!
+
+wait "$pid_normal" "$pid_newpkgs" "$pid_phased" || true
+
+mapfile -t pkgs_phased <"$tmp_phased"
+mapfile -t need_newpkgs < <(comm -13 "$tmp_normal" "$tmp_newpkgs")
+mapfile -t need_phasing < <(comm -13 "$tmp_newpkgs" "$tmp_phased")
+mapfile -t held < <(apt-mark showhold 2>/dev/null || true)
+
+if ((${#pkgs_phased[@]} == 0)); then
+	echo -e "${GREEN}Nothing to upgrade.${RESET}"
+	exit 0
+fi
+
+if ((${#need_newpkgs[@]} == 0 && ${#need_phasing[@]} == 0)); then
+	echo -e "${GREEN}Upgrades available with a normal upgrade.${RESET}"
+	echo -e "${BLUE}Running: apt-get upgrade -y${RESET}"
+	run_cmd apt-get "${APT_OPTS[@]}" upgrade -y
+	exit 0
+fi
+
+if ((${#need_newpkgs[@]} > 0)); then
+	echo -e "${YELLOW}Packages requiring --with-new-pkgs (classic kept-back/deferred):${RESET}"
+	printf "  %s\n" "${need_newpkgs[@]}"
+fi
+
+if ((${#need_phasing[@]} > 0)); then
+	echo -e "${YELLOW}Packages deferred due to phasing (will be forced in this run):${RESET}"
+	printf "  %s\n" "${need_phasing[@]}"
+fi
+
+if ((${#held[@]} > 0)); then
+	echo -e "${YELLOW}Held packages (not touched):${RESET} ${YELLOW}${held[*]}${RESET}"
+fi
+
+if ((${#need_phasing[@]} > 0)); then
+	echo -e "${BLUE}Running upgrade with new packages + phasing override...${RESET}"
+	run_cmd apt-get "${APT_OPTS[@]}" "${PHASE_OPTS[@]}" --with-new-pkgs upgrade -y
+elif ((${#need_newpkgs[@]} > 0)); then
+	echo -e "${BLUE}Running upgrade with new packages enabled...${RESET}"
+	run_cmd apt-get "${APT_OPTS[@]}" --with-new-pkgs upgrade -y
+fi
+
+echo -e "${GREEN}Done.${RESET}"

@@ -1,0 +1,4 @@
+#!/bin/sh
+for k in /etc/ssh/ssh_host_*_key.pub; do
+	ssh-keygen -l -f "$k"
+done
