@@ -80,13 +80,14 @@ echo -e "${BLUE}Analysing upgrade candidates...${RESET}"
 tmp_normal="$(mktemp)"
 tmp_newpkgs="$(mktemp)"
 tmp_phased="$(mktemp)"
-trap 'rm -f "$tmp_normal" "$tmp_newpkgs" "$tmp_phased"' EXIT
+tmp_phased_raw="$(mktemp)"
+trap 'rm -f "$tmp_normal" "$tmp_newpkgs" "$tmp_phased" "$tmp_phased_raw"' EXIT
 
 apt-get -s "${APT_OPTS[@]}" upgrade 2>/dev/null | extract_inst_pkgs >"$tmp_normal" &
 pid_normal=$!
 apt-get -s "${APT_OPTS[@]}" --with-new-pkgs upgrade 2>/dev/null | extract_inst_pkgs >"$tmp_newpkgs" &
 pid_newpkgs=$!
-apt-get -s "${APT_OPTS[@]}" "${PHASE_OPTS[@]}" --with-new-pkgs upgrade 2>/dev/null | extract_inst_pkgs >"$tmp_phased" &
+apt-get -s "${APT_OPTS[@]}" "${PHASE_OPTS[@]}" --with-new-pkgs upgrade 2>/dev/null | tee "$tmp_phased_raw" | extract_inst_pkgs >"$tmp_phased" &
 pid_phased=$!
 
 wait "$pid_normal" "$pid_newpkgs" "$pid_phased" || true
@@ -95,9 +96,14 @@ mapfile -t pkgs_phased <"$tmp_phased"
 mapfile -t need_newpkgs < <(comm -13 "$tmp_normal" "$tmp_newpkgs")
 mapfile -t need_phasing < <(comm -13 "$tmp_newpkgs" "$tmp_phased")
 mapfile -t held < <(apt-mark showhold 2>/dev/null || true)
+mapfile -t kept_back < <(sed -n '/kept back/{n;p}' "$tmp_phased_raw" | xargs -n1 2>/dev/null || true)
 
 if ((${#pkgs_phased[@]} == 0)); then
-	echo -e "${GREEN}Nothing to upgrade.${RESET}"
+	if ((${#kept_back[@]} > 0)); then
+		echo -e "${YELLOW}No upgrade performed: the following packages are held back due to unmet dependencies, likely caused by mirror synchronization lag:${RESET} ${kept_back[*]}"
+	else
+		echo -e "${GREEN}Nothing to upgrade.${RESET}"
+	fi
 	exit 0
 fi
 
