@@ -15,6 +15,7 @@ Usage: upgradeall [--dry-run] [--no-color]
 Handles:
   - kept back / deferred due to new deps (uses --with-new-pkgs)
   - deferred due to phasing (re-runs with phasing override only if needed)
+  - automatically removable packages (uses autoremove)
 EOF
 		exit 0
 		;;
@@ -45,7 +46,7 @@ die() {
 }
 trap 'die "Failed at line $LINENO: $BASH_COMMAND"' ERR
 
-[[ ${EUID:-$(id -u)} -eq 0 ]] || die "Please run this script as root or using sudo."
+[[ "$DRY_RUN" -eq 1 || ${EUID:-$(id -u)} -eq 0 ]] || die "Please run this script as root or using sudo."
 
 for cmd in apt-get apt-mark awk sort comm; do
 	command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
@@ -64,12 +65,53 @@ extract_inst_pkgs() {
 	awk '/^Inst /{print $2}' | sort -u
 }
 
+extract_kept_back_pkgs() {
+	awk '
+		/kept back/ {
+			in_list = 1
+			next
+		}
+		in_list && /^[[:space:]]/ {
+			for (i = 1; i <= NF; i++) {
+				print $i
+			}
+			next
+		}
+		{
+			in_list = 0
+		}
+	' | sort -u
+}
+
+extract_remv_pkgs() {
+	awk '/^Remv /{print $2}' | sort -u
+}
+
 run_cmd() {
 	if [[ "$DRY_RUN" -eq 1 ]]; then
 		echo -e "${YELLOW}[dry-run]${RESET} $*"
 	else
 		"$@"
 	fi
+}
+
+maybe_autoremove() {
+	local tmp_autoremove
+	local -a autoremove_pkgs
+	tmp_autoremove="$(mktemp)"
+	apt-get -s "${APT_OPTS[@]}" autoremove 2>/dev/null | extract_remv_pkgs >"$tmp_autoremove"
+	mapfile -t autoremove_pkgs <"$tmp_autoremove"
+	rm -f "$tmp_autoremove"
+
+	if ((${#autoremove_pkgs[@]} == 0)); then
+		return
+	fi
+
+	echo -e "${YELLOW}Packages no longer required:${RESET}"
+	printf "  %s\n" "${autoremove_pkgs[@]}"
+	echo -e "${BLUE}Running autoremove...${RESET}"
+	run_cmd apt-get "${APT_OPTS[@]}" autoremove -y
+	echo -e "${GREEN}Autoremove complete.${RESET}"
 }
 
 echo -e "${BLUE}Updating package lists...${RESET}"
@@ -96,14 +138,14 @@ mapfile -t pkgs_phased <"$tmp_phased"
 mapfile -t need_newpkgs < <(comm -13 "$tmp_normal" "$tmp_newpkgs")
 mapfile -t need_phasing < <(comm -13 "$tmp_newpkgs" "$tmp_phased")
 mapfile -t held < <(apt-mark showhold 2>/dev/null || true)
-mapfile -t kept_back < <(sed -n '/kept back/{n;p}' "$tmp_phased_raw" | xargs -n1 2>/dev/null || true)
+mapfile -t kept_back < <(extract_kept_back_pkgs <"$tmp_phased_raw")
 
 if ((${#pkgs_phased[@]} == 0)); then
+	echo -e "${GREEN}Nothing to upgrade.${RESET}"
 	if ((${#kept_back[@]} > 0)); then
-		echo -e "${YELLOW}No upgrade performed: the following packages are held back due to unmet dependencies, likely caused by mirror synchronization lag:${RESET} ${kept_back[*]}"
-	else
-		echo -e "${GREEN}Nothing to upgrade.${RESET}"
+		echo -e "${YELLOW}Held back by apt:${RESET} ${kept_back[*]}"
 	fi
+	maybe_autoremove
 	exit 0
 fi
 
@@ -111,6 +153,7 @@ if ((${#need_newpkgs[@]} == 0 && ${#need_phasing[@]} == 0)); then
 	echo -e "${GREEN}Upgrades available with a normal upgrade.${RESET}"
 	echo -e "${BLUE}Running: apt-get upgrade -y${RESET}"
 	run_cmd apt-get "${APT_OPTS[@]}" upgrade -y
+	maybe_autoremove
 	exit 0
 fi
 
@@ -136,4 +179,5 @@ elif ((${#need_newpkgs[@]} > 0)); then
 	run_cmd apt-get "${APT_OPTS[@]}" --with-new-pkgs upgrade -y
 fi
 
+maybe_autoremove
 echo -e "${GREEN}Done.${RESET}"
