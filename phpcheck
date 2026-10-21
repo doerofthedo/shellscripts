@@ -1,26 +1,45 @@
 #!/bin/bash
-set -Eeuo pipefail
+set -euo pipefail
+export LC_ALL=C
 
 # Minimum upstream releases fixing CVE-2026-109618 and CVE-2026-109619.
 declare -Ar SAFE_VERSION=(
-	[8.2]=8.2.35
-	[8.3]=8.3.36
-	[8.4]=8.4.27
-	[8.5]=8.5.12
+	["8.2"]=8.2.35
+	["8.3"]=8.3.36
+	["8.4"]=8.4.27
+	["8.5"]=8.5.12
+)
+
+# Ubuntu Security Notice USN-8948-1 fixed package versions. These are
+# deliberately full Debian package versions: Ubuntu backports the fixes while
+# retaining the PHP version originally shipped with each release.
+declare -Ar UBUNTU_SAFE_VERSION=(
+	["22.04:8.1"]=8.1.2-1ubuntu2.28
+	["24.04:8.3"]=8.3.6-0ubuntu0.24.04.13
+	["26.04:8.5"]=8.5.4-0ubuntu1.5
+	["26.10:8.5"]=8.5.9-0ubuntu2.1
+)
+
+declare -Ar UBUNTU_VERSION_BY_CODENAME=(
+	["jammy"]=22.04
+	["noble"]=24.04
+	["resolute"]=26.04
+	["stonking"]=26.10
 )
 
 UPDATE=0
-NO_COLOR=0
+NO_COLOR_REQUESTED=0
 
 usage() {
 	cat <<'EOF'
 Usage: phpcheck [--update] [--no-color]
 
 Audits installed Debian/Ubuntu PHP packages. It checks:
-  - PHP 8.2-8.5 against the releases fixing CVE-2026-109618 and
-    CVE-2026-109619
-  - every installed php* and libapache2-mod-php* package against its
-    current APT candidate
+  - PHP core packages for fixes to CVE-2026-109618 and CVE-2026-109619,
+    including known Ubuntu backports and backports recorded in the installed
+    Debian changelog
+  - every installed php*, libapache2-mod-php*, and libphp*-embed package
+    against its current APT candidate
 
 Options:
   --update     Run apt-get update before checking (requires root)
@@ -29,28 +48,28 @@ Options:
 
 Exit status:
   0  All detected branches are secure and all packages are current
-  1  An insecure, unsupported, outdated, or unverifiable item was found
+  1  An insecure, outdated, inconsistent, or unverifiable item was found
   2  Usage error or a required command is missing
 EOF
 }
 
 for arg in "$@"; do
 	case "$arg" in
-	--update) UPDATE=1 ;;
-	--no-color) NO_COLOR=1 ;;
-	-h | --help)
-		usage
-		exit 0
-		;;
-	*)
-		echo "Unknown argument: $arg" >&2
-		usage >&2
-		exit 2
-		;;
+		--update) UPDATE=1 ;;
+		--no-color) NO_COLOR_REQUESTED=1 ;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		*)
+			echo "Unknown argument: $arg" >&2
+			usage >&2
+			exit 2
+			;;
 	esac
 done
 
-if [[ "$NO_COLOR" -eq 1 || ! -t 1 ]]; then
+if [[ "$NO_COLOR_REQUESTED" -eq 1 || -n ${NO_COLOR:-} || ! -t 1 ]]; then
 	RED=""
 	GREEN=""
 	YELLOW=""
@@ -69,7 +88,7 @@ die() {
 	exit 2
 }
 
-for cmd in apt-cache awk dpkg dpkg-query sort; do
+for cmd in apt-cache awk dpkg dpkg-query grep sort zgrep; do
 	command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
 done
 
@@ -80,44 +99,121 @@ if [[ "$UPDATE" -eq 1 ]]; then
 	apt-get update
 fi
 
+if ! package_output=$(dpkg-query -W \
+	-f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\t${db:Status-Abbrev}\n' 2>&1); then
+	die "Unable to read the dpkg package database: ${package_output//$'\n'/ }"
+fi
+
+if ! inventory_output=$(
+	awk -F '\t' '
+		$5 ~ /^ii/ && ($1 ~ /^php/ || $1 ~ /^libapache2-mod-php/ || $1 ~ /^libphp[0-9]+\.[0-9]+-embed(:|$)/) {
+			print $1 "\t" $2 "\t" $3 "\t" $4
+		}
+	' <<<"$package_output" | sort -t $'\t' -k1,1V
+); then
+	die "Unable to process the dpkg package inventory"
+fi
+
 declare -a package_rows=()
-mapfile -t package_rows < <(
-	dpkg-query -W \
-		-f='${binary:Package}\t${Version}\t${db:Status-Abbrev}\n' \
-		'php*' 'libapache2-mod-php*' 2>/dev/null |
-		awk -F '\t' '$3 ~ /^ii/ {print $1 "\t" $2}' |
-		sort -t $'\t' -k1,1V
-)
+if [[ -n $inventory_output ]]; then
+	mapfile -t package_rows <<<"$inventory_output"
+fi
 
 if ((${#package_rows[@]} == 0)); then
-	printf '%bNo installed php* or libapache2-mod-php* packages found.%b\n' "$YELLOW" "$RESET"
+	printf '%bNo installed PHP packages found.%b\n' "$YELLOW" "$RESET"
 	exit 0
 fi
 
 declare -A branch_count=()
-declare -A branch_version=()
+declare -A branch_core_count=()
+declare -A branch_source=()
+declare -A branch_source_version=()
+declare -A branch_doc_package=()
+declare -A branch_mixed_versions=()
 
 for row in "${package_rows[@]}"; do
-	IFS=$'\t' read -r package installed <<<"$row"
-	package=${package%%:*}
+	IFS=$'\t' read -r package installed source source_version <<<"$row"
+	base_package=${package%%:*}
 	branch=""
 
-	if [[ $package =~ ^php([0-9]+\.[0-9]+)(-|$) ]]; then
+	if [[ $base_package =~ ^php([0-9]+\.[0-9]+)(-|$) ]]; then
 		branch=${BASH_REMATCH[1]}
-	elif [[ $package =~ ^libapache2-mod-php([0-9]+\.[0-9]+)$ ]]; then
+	elif [[ $base_package =~ ^libapache2-mod-php([0-9]+\.[0-9]+)$ ]]; then
+		branch=${BASH_REMATCH[1]}
+	elif [[ $base_package =~ ^libphp([0-9]+\.[0-9]+)-embed$ ]]; then
 		branch=${BASH_REMATCH[1]}
 	fi
 
 	if [[ -n $branch ]]; then
-		branch_count[$branch]=$(( ${branch_count[$branch]:-0} + 1 ))
-		if [[ $package == "php$branch-common" ]]; then
-			debian_version=${installed#*:}
-			if [[ $debian_version =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-				branch_version[$branch]=${BASH_REMATCH[1]}
+		branch_count[$branch]=$((${branch_count[$branch]:-0} + 1))
+		if [[ $source == "php$branch" ]]; then
+			branch_core_count[$branch]=$((${branch_core_count[$branch]:-0} + 1))
+			branch_source[$branch]=$source
+			if [[ -z ${branch_source_version[$branch]:-} ]]; then
+				branch_source_version[$branch]=$source_version
+				branch_doc_package[$branch]=$base_package
+			else
+				if [[ $source_version != "${branch_source_version[$branch]}" ]]; then
+					branch_mixed_versions[$branch]=1
+				fi
+				if dpkg --compare-versions "$source_version" lt "${branch_source_version[$branch]}"; then
+					branch_source_version[$branch]=$source_version
+					branch_doc_package[$branch]=$base_package
+				elif [[ $source_version == "${branch_source_version[$branch]}" && $base_package == "php$branch-common" ]]; then
+					branch_doc_package[$branch]=$base_package
+				fi
 			fi
 		fi
 	fi
 done
+
+os_id=""
+os_id_like=""
+os_version_id=""
+ubuntu_codename=""
+ubuntu_version=""
+if [[ -r /etc/os-release ]]; then
+	os_id=$(awk -F= '$1 == "ID" {gsub(/^"|"$/, "", $2); print $2}' /etc/os-release)
+	os_id_like=$(awk -F= '$1 == "ID_LIKE" {gsub(/^"|"$/, "", $2); print $2}' /etc/os-release)
+	os_version_id=$(awk -F= '$1 == "VERSION_ID" {gsub(/^"|"$/, "", $2); print $2}' /etc/os-release)
+	ubuntu_codename=$(awk -F= '$1 == "UBUNTU_CODENAME" {gsub(/^"|"$/, "", $2); print $2}' /etc/os-release)
+fi
+
+if [[ $os_id == ubuntu ]]; then
+	ubuntu_version=$os_version_id
+elif [[ " $os_id_like " == *" ubuntu "* && -n $ubuntu_codename ]]; then
+	ubuntu_version=${UBUNTU_VERSION_BY_CODENAME[$ubuntu_codename]:-}
+fi
+
+upstream_version() {
+	local version=${1#*:}
+	if [[ $version =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+		printf '%s\n' "${BASH_REMATCH[1]}"
+	fi
+}
+
+changelog_contains() {
+	local package=${1%%:*}
+	local needle=$2
+	local file
+	local -a changelogs=()
+
+	shopt -s nullglob
+	changelogs=("/usr/share/doc/$package"/changelog*)
+	shopt -u nullglob
+
+	for file in "${changelogs[@]}"; do
+		if [[ $file == *.gz ]]; then
+			if zgrep -Fq -- "$needle" "$file" 2>/dev/null; then
+				return 0
+			fi
+		elif grep -Fq -- "$needle" "$file" 2>/dev/null; then
+			return 0
+		fi
+	done
+
+	return 1
+}
 
 issues=0
 declare -a apt_errors=()
@@ -131,43 +227,127 @@ if ((${#branch_count[@]} == 0)); then
 else
 	mapfile -t branches < <(printf '%s\n' "${!branch_count[@]}" | sort -V)
 	for branch in "${branches[@]}"; do
-		installed=${branch_version[$branch]:-}
+		installed=${branch_source_version[$branch]:-}
+		source=${branch_source[$branch]:-}
+		doc_package=${branch_doc_package[$branch]:-}
 		minimum=${SAFE_VERSION[$branch]:-}
+		vendor_minimum=""
+		vendor_key=""
+		installed_upstream=$(upstream_version "$installed")
+
+		if [[ -n $ubuntu_version ]]; then
+			vendor_key="$ubuntu_version:$branch"
+			vendor_minimum=${UBUNTU_SAFE_VERSION[$vendor_key]:-}
+		fi
 
 		if [[ -z $installed ]]; then
-			printf '  %bFAIL%b PHP %-4s cannot determine core version (%d packages)\n' \
+			printf '  %bFAIL%b PHP %-4s cannot determine its core source-package version (%d packages)\n' \
 				"$RED" "$RESET" "$branch" "${branch_count[$branch]}"
 			issues=$((issues + 1))
-		elif [[ -z $minimum ]]; then
-			printf '  %bFAIL%b PHP %-4s %-8s has no supported security baseline in this check\n' \
-				"$RED" "$RESET" "$branch" "$installed"
-			issues=$((issues + 1))
-		elif dpkg --compare-versions "$installed" ge "$minimum"; then
-			printf '  %bOK%b   PHP %-4s %-8s (minimum %s; %d packages)\n' \
-				"$GREEN" "$RESET" "$branch" "$installed" "$minimum" "${branch_count[$branch]}"
+		elif [[ -n $minimum && -n $installed_upstream ]] &&
+			dpkg --compare-versions "$installed_upstream" ge "$minimum"; then
+			printf '%bSAFE%b PHP %s\n' "$GREEN" "$RESET" "$branch"
+			printf '    source package: %s\n' "$source"
+			printf '    installed:      %s\n' "$installed"
+			printf '    evidence:       upstream %s >= fixed release %s\n' \
+				"$installed_upstream" "$minimum"
+		elif [[ -n $vendor_minimum && $installed == *ubuntu* && $installed != *+* ]] &&
+			dpkg --compare-versions "$installed" ge "$vendor_minimum"; then
+			printf '%bSAFE%b PHP %s\n' "$GREEN" "$RESET" "$branch"
+			printf '    source package: %s\n' "$source"
+			printf '    installed:      %s\n' "$installed"
+			printf '    evidence:       Ubuntu %s package >= %s (USN-8948-1)\n' \
+				"$ubuntu_version" "$vendor_minimum"
+		elif [[ -n $doc_package ]] &&
+			changelog_contains "$doc_package" CVE-2026-109618 &&
+			changelog_contains "$doc_package" CVE-2026-109619; then
+			printf '%bSAFE%b PHP %s\n' "$GREEN" "$RESET" "$branch"
+			printf '    source package: %s\n' "$source"
+			printf '    installed:      %s\n' "$installed"
+			printf '    evidence:       both CVEs are recorded in %s installed changelog\n' \
+				"$doc_package"
 		else
-			printf '  %bFAIL%b PHP %-4s %-8s is below %s (%d packages)\n' \
-				"$RED" "$RESET" "$branch" "$installed" "$minimum" "${branch_count[$branch]}"
+			printf '%bUNVERIFIED%b PHP %s\n' "$RED" "$RESET" "$branch"
+			printf '    source package: %s\n' "$source"
+			printf '    installed:      %s\n' "$installed"
+			if [[ -n $minimum ]]; then
+				printf '    evidence:       upstream release is below %s and no vendor backport evidence was found\n' "$minimum"
+			else
+				printf '    evidence:       no upstream baseline or vendor backport evidence was found\n'
+			fi
+			issues=$((issues + 1))
+		fi
+		printf '    packages:       %d core, %d total for this branch\n' \
+			"${branch_core_count[$branch]:-0}" "${branch_count[$branch]}"
+		if [[ ${branch_mixed_versions[$branch]:-0} -eq 1 ]]; then
+			printf '    %bwarning:%b        mixed PHP core source-package versions are installed\n' \
+				"$YELLOW" "$RESET"
 			issues=$((issues + 1))
 		fi
 	done
 fi
 
-printf '\n%bAPT package check%b\n' "$BLUE" "$RESET"
-printf '%-40s  %-34s  %-34s  %s\n' "PACKAGE" "INSTALLED" "CANDIDATE" "STATUS"
-printf '%-40s  %-34s  %-34s  %s\n' "-------" "---------" "---------" "------"
+printf '\n%bAPT package status%b\n' "$BLUE" "$RESET"
+if [[ $UPDATE -eq 1 ]]; then
+	printf '  Metadata: refresh requested before check\n\n'
+else
+	printf '  Metadata: cached (use --update to refresh)\n\n'
+fi
+
+print_package() {
+	local package=$1
+	local source=$2
+	local installed=$3
+	local candidate=$4
+	local status=$5
+
+	printf '%s [%b]\n' "$package" "$status"
+	printf '    source package: %s\n' "$source"
+	printf '    installed:      %s\n' "$installed"
+	printf '    candidate:      %s\n\n' "$candidate"
+}
+
+declare -a package_names=()
+declare -A apt_candidate=()
+policy_failed=0
+policy_error=""
 
 for row in "${package_rows[@]}"; do
-	IFS=$'\t' read -r package installed <<<"$row"
-	if policy_output=$(apt-cache policy "$package" 2>&1); then
-		candidate=$(awk '$1 == "Candidate:" {print $2}' <<<"$policy_output")
-	else
+	IFS=$'\t' read -r package _ <<<"$row"
+	package_names+=("$package")
+done
+
+if policy_output=$(apt-cache policy "${package_names[@]}" 2>&1); then
+	while IFS=$'\t' read -r policy_package candidate; do
+		apt_candidate[$policy_package]=$candidate
+	done < <(
+		awk '
+			/^[^[:space:]]/ && /:$/ {
+				package = $0
+				sub(/:$/, "", package)
+			}
+			$1 == "Candidate:" { print package "\t" $2 }
+		' <<<"$policy_output"
+	)
+else
+	policy_failed=1
+	policy_error=${policy_output//$'\n'/ }
+	apt_errors+=("apt-cache policy: $policy_error")
+fi
+
+for row in "${package_rows[@]}"; do
+	IFS=$'\t' read -r package installed source source_version <<<"$row"
+	if ((policy_failed)); then
 		candidate="(error)"
 		status="${RED}APT-ERROR${RESET}"
-		apt_errors+=("$package: ${policy_output//$'\n'/ }")
 		issues=$((issues + 1))
-		printf '%-40s  %-34s  %-34s  %b\n' "$package" "$installed" "$candidate" "$status"
+		print_package "$package" "$source" "$installed" "$candidate" "$status"
 		continue
+	fi
+
+	candidate=${apt_candidate[$package]-}
+	if [[ -z $candidate ]]; then
+		candidate=${apt_candidate[${package%%:*}]-}
 	fi
 
 	if [[ -z $candidate || $candidate == "(none)" ]]; then
@@ -175,7 +355,7 @@ for row in "${package_rows[@]}"; do
 		candidate="(none)"
 		issues=$((issues + 1))
 	elif dpkg --compare-versions "$installed" eq "$candidate"; then
-		status="${GREEN}current${RESET}"
+		status="${GREEN}apt-current${RESET}"
 	elif dpkg --compare-versions "$installed" lt "$candidate"; then
 		status="${RED}OUTDATED${RESET}"
 		issues=$((issues + 1))
@@ -183,10 +363,9 @@ for row in "${package_rows[@]}"; do
 		status="${YELLOW}newer-than-repo${RESET}"
 	fi
 
-	printf '%-40s  %-34s  %-34s  %b\n' "$package" "$installed" "$candidate" "$status"
+	print_package "$package" "$source" "$installed" "$candidate" "$status"
 done
 
-printf '\n'
 if ((${#apt_errors[@]} > 0)); then
 	printf '%bAPT errors:%b\n' "$RED" "$RESET"
 	printf '  %s\n' "${apt_errors[@]}"
@@ -194,12 +373,12 @@ if ((${#apt_errors[@]} > 0)); then
 fi
 
 if ((issues == 0)); then
-	printf '%bPASS:%b all detected PHP branches meet the security baseline and all %d packages are current.\n' \
+	printf '%bPASS:%b all detected PHP core packages contain both fixes; no PHP package upgrades are pending (%d checked).\n' \
 		"$GREEN" "$RESET" "${#package_rows[@]}"
 	exit 0
 fi
 
 printf '%bFAIL:%b found %d issue(s). Run %s with --update if the APT cache may be stale.\n' \
 	"$RED" "$RESET" "$issues" "sudo phpcheck"
-printf 'Vendor backports are not assumed: versions below the listed upstream release require manual vendor verification.\n'
+printf 'UNVERIFIED means no upstream-version, known vendor-version, or installed-changelog proof was found.\n'
 exit 1
