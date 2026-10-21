@@ -10,6 +10,16 @@ declare -Ar SAFE_VERSION=(
 	["8.5"]=8.5.12
 )
 
+# The PHP security team published minimal source-only backports for these EOL
+# branches. There is no new upstream release number to compare, so an installed
+# Debian/Ubuntu package is accepted only when vendor package-version data or
+# its installed changelog proves that both CVEs were backported.
+declare -Ar EOL_SOURCE_BACKPORT=(
+	["7.4"]=1
+	["8.0"]=1
+	["8.1"]=1
+)
+
 # Ubuntu Security Notice USN-8948-1 fixed package versions. These are
 # deliberately full Debian package versions: Ubuntu backports the fixes while
 # retaining the PHP version originally shipped with each release.
@@ -36,8 +46,9 @@ Usage: phpcheck [--update] [--no-color]
 
 Audits installed Debian/Ubuntu PHP packages. It checks:
   - PHP core packages for fixes to CVE-2026-109618 and CVE-2026-109619,
-    including known Ubuntu backports and backports recorded in the installed
-    Debian changelog
+    including PHP's minimal source backports for 7.4, 8.0, and 8.1 when
+    recorded by the package vendor, plus known Ubuntu backports;
+    upstream-EOL branches are identified separately
   - every installed php*, libapache2-mod-php*, and libphp*-embed package
     against its current APT candidate
 
@@ -47,9 +58,18 @@ Options:
   -h, --help   Show this help
 
 Exit status:
-  0  All detected branches are secure and all packages are current
-  1  An insecure, outdated, inconsistent, or unverifiable item was found
+  0  Both scoped CVEs are fixed and no package upgrades are pending
+  1  A fix is unverified, a package issue was found, or an APT check failed
   2  Usage error or a required command is missing
+
+APT package status:
+  apt-current       Installed version equals APT's current candidate
+  OUTDATED          APT offers a newer candidate
+  newer-than-repo   Installed version is newer than APT's candidate
+  UNKNOWN           APT has no candidate for the installed package
+  APT-ERROR         APT candidate lookup failed
+
+APT metadata is local. Use --update to refresh it before the audit.
 EOF
 }
 
@@ -96,7 +116,11 @@ if [[ "$UPDATE" -eq 1 ]]; then
 	command -v apt-get >/dev/null 2>&1 || die "Missing required command: apt-get"
 	[[ ${EUID:-$(id -u)} -eq 0 ]] || die "--update must be run as root or with sudo"
 	printf '%bUpdating APT package lists...%b\n' "$BLUE" "$RESET"
-	apt-get update
+	if ! apt-get update; then
+		printf '%bERROR:%b APT package-list update failed; package candidates were not checked.\n' \
+			"$RED" "$RESET" >&2
+		exit 1
+	fi
 fi
 
 if ! package_output=$(dpkg-query -W \
@@ -216,6 +240,7 @@ changelog_contains() {
 }
 
 issues=0
+eol_branches=0
 declare -a apt_errors=()
 
 printf '%bPHP security release check%b\n' "$BLUE" "$RESET"
@@ -233,6 +258,8 @@ else
 		minimum=${SAFE_VERSION[$branch]:-}
 		vendor_minimum=""
 		vendor_key=""
+		fixed=0
+		evidence=""
 		installed_upstream=$(upstream_version "$installed")
 
 		if [[ -n $ubuntu_version ]]; then
@@ -246,37 +273,54 @@ else
 			issues=$((issues + 1))
 		elif [[ -n $minimum && -n $installed_upstream ]] &&
 			dpkg --compare-versions "$installed_upstream" ge "$minimum"; then
-			printf '%bSAFE%b PHP %s\n' "$GREEN" "$RESET" "$branch"
-			printf '    source package: %s\n' "$source"
-			printf '    installed:      %s\n' "$installed"
-			printf '    evidence:       upstream %s >= fixed release %s\n' \
-				"$installed_upstream" "$minimum"
+			fixed=1
+			evidence="upstream $installed_upstream >= fixed release $minimum"
 		elif [[ -n $vendor_minimum && $installed == *ubuntu* && $installed != *+* ]] &&
 			dpkg --compare-versions "$installed" ge "$vendor_minimum"; then
-			printf '%bSAFE%b PHP %s\n' "$GREEN" "$RESET" "$branch"
-			printf '    source package: %s\n' "$source"
-			printf '    installed:      %s\n' "$installed"
-			printf '    evidence:       Ubuntu %s package >= %s (USN-8948-1)\n' \
-				"$ubuntu_version" "$vendor_minimum"
+			fixed=1
+			evidence="Ubuntu $ubuntu_version package >= $vendor_minimum (USN-8948-1)"
 		elif [[ -n $doc_package ]] &&
 			changelog_contains "$doc_package" CVE-2026-109618 &&
 			changelog_contains "$doc_package" CVE-2026-109619; then
-			printf '%bSAFE%b PHP %s\n' "$GREEN" "$RESET" "$branch"
-			printf '    source package: %s\n' "$source"
-			printf '    installed:      %s\n' "$installed"
-			printf '    evidence:       both CVEs are recorded in %s installed changelog\n' \
-				"$doc_package"
+			fixed=1
+			if [[ -n ${EOL_SOURCE_BACKPORT[$branch]:-} ]]; then
+				evidence="installed changelog records both CVEs (PHP $branch minimal source backport)"
+			else
+				evidence="both CVEs are recorded in $doc_package installed changelog"
+			fi
 		else
 			printf '%bUNVERIFIED%b PHP %s\n' "$RED" "$RESET" "$branch"
 			printf '    source package: %s\n' "$source"
 			printf '    installed:      %s\n' "$installed"
 			if [[ -n $minimum ]]; then
 				printf '    evidence:       upstream release is below %s and no vendor backport evidence was found\n' "$minimum"
+			elif [[ -n ${EOL_SOURCE_BACKPORT[$branch]:-} ]]; then
+				printf '    evidence:       PHP published a minimal source backport, but this package has no proof that it includes both fixes\n'
 			else
 				printf '    evidence:       no upstream baseline or vendor backport evidence was found\n'
 			fi
 			issues=$((issues + 1))
 		fi
+
+		if [[ $fixed -eq 1 ]]; then
+			if [[ -n $minimum ]]; then
+				printf '%bSAFE%b PHP %s\n' "$GREEN" "$RESET" "$branch"
+			elif [[ -n ${EOL_SOURCE_BACKPORT[$branch]:-} ]]; then
+				printf '%bCVE-FIXED%b PHP %s [upstream-EOL]\n' "$YELLOW" "$RESET" "$branch"
+				eol_branches=$((eol_branches + 1))
+			else
+				printf '%bCVE-FIXED%b PHP %s [no upstream baseline]\n' "$YELLOW" "$RESET" "$branch"
+			fi
+			printf '    source package: %s\n' "$source"
+			printf '    installed:      %s\n' "$installed"
+			printf '    evidence:       %s\n' "$evidence"
+			if [[ -n ${EOL_SOURCE_BACKPORT[$branch]:-} ]]; then
+				printf '    lifecycle:      upstream EOL; only the scoped CVE fixes are verified\n'
+			elif [[ -z $minimum ]]; then
+				printf '    lifecycle:      not modeled; only the scoped CVE fixes are verified\n'
+			fi
+		fi
+
 		printf '    packages:       %d core, %d total for this branch\n' \
 			"${branch_core_count[$branch]:-0}" "${branch_count[$branch]}"
 		if [[ ${branch_mixed_versions[$branch]:-0} -eq 1 ]]; then
@@ -375,6 +419,10 @@ fi
 if ((issues == 0)); then
 	printf '%bPASS:%b all detected PHP core packages contain both fixes; no PHP package upgrades are pending (%d checked).\n' \
 		"$GREEN" "$RESET" "${#package_rows[@]}"
+	if ((eol_branches > 0)); then
+		printf '%bNOTICE:%b %d upstream-EOL PHP branch(es) detected; PASS applies only to the two scoped CVEs.\n' \
+			"$YELLOW" "$RESET" "$eol_branches"
+	fi
 	exit 0
 fi
 

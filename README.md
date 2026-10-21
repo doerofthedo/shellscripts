@@ -34,7 +34,7 @@ This section is included because it may be impossible to understand what some of
 * `odfgrep <string> <files ..>` identifies ODF files that contain the string
 * `onlyascii` filter out non-printable characters
 * `paths2fs <basedir>` convert list of paths (e.g. find output) to actual filesystem
-* `phpcheck [--update]` checks installed Debian/Ubuntu PHP components against current APT candidates and verifies CVE-2026-109618/CVE-2026-109619 fixes in upstream or vendor-backported PHP core packages
+* `phpcheck [--update] [--no-color]` checks installed Debian/Ubuntu PHP components against current APT candidates, verifies CVE-2026-109618/CVE-2026-109619 fixes in upstream or vendor-backported PHP core packages (including PHP's minimal 7.4/8.0/8.1 source backports), and identifies upstream-EOL branches
 * `pdf2image <file.pdf> [out.pdf]` 'print-and-scan' file.pdf document, save as out.pdf; pauses in the middle so edits can be done if needed
 * `pdfbooklet <file.pdf>` prepares file.pdf to be printed as a book (two-sided); BOOK1-file.pdf is to be printed on one side and BOOK2-file.pdf on the other side of the paper stack
 * `pdf.clear-meta <file.pdf>` removes metadata from file.pdf overwriting it
