@@ -1,0 +1,205 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+# Minimum upstream releases fixing CVE-2026-109618 and CVE-2026-109619.
+declare -Ar SAFE_VERSION=(
+	[8.2]=8.2.35
+	[8.3]=8.3.36
+	[8.4]=8.4.27
+	[8.5]=8.5.12
+)
+
+UPDATE=0
+NO_COLOR=0
+
+usage() {
+	cat <<'EOF'
+Usage: phpcheck [--update] [--no-color]
+
+Audits installed Debian/Ubuntu PHP packages. It checks:
+  - PHP 8.2-8.5 against the releases fixing CVE-2026-109618 and
+    CVE-2026-109619
+  - every installed php* and libapache2-mod-php* package against its
+    current APT candidate
+
+Options:
+  --update     Run apt-get update before checking (requires root)
+  --no-color   Disable colored output
+  -h, --help   Show this help
+
+Exit status:
+  0  All detected branches are secure and all packages are current
+  1  An insecure, unsupported, outdated, or unverifiable item was found
+  2  Usage error or a required command is missing
+EOF
+}
+
+for arg in "$@"; do
+	case "$arg" in
+	--update) UPDATE=1 ;;
+	--no-color) NO_COLOR=1 ;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		echo "Unknown argument: $arg" >&2
+		usage >&2
+		exit 2
+		;;
+	esac
+done
+
+if [[ "$NO_COLOR" -eq 1 || ! -t 1 ]]; then
+	RED=""
+	GREEN=""
+	YELLOW=""
+	BLUE=""
+	RESET=""
+else
+	RED=$'\e[31m'
+	GREEN=$'\e[32m'
+	YELLOW=$'\e[33m'
+	BLUE=$'\e[34m'
+	RESET=$'\e[0m'
+fi
+
+die() {
+	printf '%bERROR:%b %s\n' "$RED" "$RESET" "$*" >&2
+	exit 2
+}
+
+for cmd in apt-cache awk dpkg dpkg-query sort; do
+	command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
+done
+
+if [[ "$UPDATE" -eq 1 ]]; then
+	command -v apt-get >/dev/null 2>&1 || die "Missing required command: apt-get"
+	[[ ${EUID:-$(id -u)} -eq 0 ]] || die "--update must be run as root or with sudo"
+	printf '%bUpdating APT package lists...%b\n' "$BLUE" "$RESET"
+	apt-get update
+fi
+
+declare -a package_rows=()
+mapfile -t package_rows < <(
+	dpkg-query -W \
+		-f='${binary:Package}\t${Version}\t${db:Status-Abbrev}\n' \
+		'php*' 'libapache2-mod-php*' 2>/dev/null |
+		awk -F '\t' '$3 ~ /^ii/ {print $1 "\t" $2}' |
+		sort -t $'\t' -k1,1V
+)
+
+if ((${#package_rows[@]} == 0)); then
+	printf '%bNo installed php* or libapache2-mod-php* packages found.%b\n' "$YELLOW" "$RESET"
+	exit 0
+fi
+
+declare -A branch_count=()
+declare -A branch_version=()
+
+for row in "${package_rows[@]}"; do
+	IFS=$'\t' read -r package installed <<<"$row"
+	package=${package%%:*}
+	branch=""
+
+	if [[ $package =~ ^php([0-9]+\.[0-9]+)(-|$) ]]; then
+		branch=${BASH_REMATCH[1]}
+	elif [[ $package =~ ^libapache2-mod-php([0-9]+\.[0-9]+)$ ]]; then
+		branch=${BASH_REMATCH[1]}
+	fi
+
+	if [[ -n $branch ]]; then
+		branch_count[$branch]=$(( ${branch_count[$branch]:-0} + 1 ))
+		if [[ $package == "php$branch-common" ]]; then
+			debian_version=${installed#*:}
+			if [[ $debian_version =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+				branch_version[$branch]=${BASH_REMATCH[1]}
+			fi
+		fi
+	fi
+done
+
+issues=0
+declare -a apt_errors=()
+
+printf '%bPHP security release check%b\n' "$BLUE" "$RESET"
+printf '  Fixes checked: CVE-2026-109618, CVE-2026-109619\n'
+
+if ((${#branch_count[@]} == 0)); then
+	printf '  %bWARN%b No versioned PHP runtime packages were detected.\n' "$YELLOW" "$RESET"
+	issues=$((issues + 1))
+else
+	mapfile -t branches < <(printf '%s\n' "${!branch_count[@]}" | sort -V)
+	for branch in "${branches[@]}"; do
+		installed=${branch_version[$branch]:-}
+		minimum=${SAFE_VERSION[$branch]:-}
+
+		if [[ -z $installed ]]; then
+			printf '  %bFAIL%b PHP %-4s cannot determine core version (%d packages)\n' \
+				"$RED" "$RESET" "$branch" "${branch_count[$branch]}"
+			issues=$((issues + 1))
+		elif [[ -z $minimum ]]; then
+			printf '  %bFAIL%b PHP %-4s %-8s has no supported security baseline in this check\n' \
+				"$RED" "$RESET" "$branch" "$installed"
+			issues=$((issues + 1))
+		elif dpkg --compare-versions "$installed" ge "$minimum"; then
+			printf '  %bOK%b   PHP %-4s %-8s (minimum %s; %d packages)\n' \
+				"$GREEN" "$RESET" "$branch" "$installed" "$minimum" "${branch_count[$branch]}"
+		else
+			printf '  %bFAIL%b PHP %-4s %-8s is below %s (%d packages)\n' \
+				"$RED" "$RESET" "$branch" "$installed" "$minimum" "${branch_count[$branch]}"
+			issues=$((issues + 1))
+		fi
+	done
+fi
+
+printf '\n%bAPT package check%b\n' "$BLUE" "$RESET"
+printf '%-40s  %-34s  %-34s  %s\n' "PACKAGE" "INSTALLED" "CANDIDATE" "STATUS"
+printf '%-40s  %-34s  %-34s  %s\n' "-------" "---------" "---------" "------"
+
+for row in "${package_rows[@]}"; do
+	IFS=$'\t' read -r package installed <<<"$row"
+	if policy_output=$(apt-cache policy "$package" 2>&1); then
+		candidate=$(awk '$1 == "Candidate:" {print $2}' <<<"$policy_output")
+	else
+		candidate="(error)"
+		status="${RED}APT-ERROR${RESET}"
+		apt_errors+=("$package: ${policy_output//$'\n'/ }")
+		issues=$((issues + 1))
+		printf '%-40s  %-34s  %-34s  %b\n' "$package" "$installed" "$candidate" "$status"
+		continue
+	fi
+
+	if [[ -z $candidate || $candidate == "(none)" ]]; then
+		status="${YELLOW}UNKNOWN${RESET}"
+		candidate="(none)"
+		issues=$((issues + 1))
+	elif dpkg --compare-versions "$installed" eq "$candidate"; then
+		status="${GREEN}current${RESET}"
+	elif dpkg --compare-versions "$installed" lt "$candidate"; then
+		status="${RED}OUTDATED${RESET}"
+		issues=$((issues + 1))
+	else
+		status="${YELLOW}newer-than-repo${RESET}"
+	fi
+
+	printf '%-40s  %-34s  %-34s  %b\n' "$package" "$installed" "$candidate" "$status"
+done
+
+printf '\n'
+if ((${#apt_errors[@]} > 0)); then
+	printf '%bAPT errors:%b\n' "$RED" "$RESET"
+	printf '  %s\n' "${apt_errors[@]}"
+	printf '\n'
+fi
+
+if ((issues == 0)); then
+	printf '%bPASS:%b all detected PHP branches meet the security baseline and all %d packages are current.\n' \
+		"$GREEN" "$RESET" "${#package_rows[@]}"
+	exit 0
+fi
+
+printf '%bFAIL:%b found %d issue(s). Run %s with --update if the APT cache may be stale.\n' \
+	"$RED" "$RESET" "$issues" "sudo phpcheck"
+printf 'Vendor backports are not assumed: versions below the listed upstream release require manual vendor verification.\n'
+exit 1
